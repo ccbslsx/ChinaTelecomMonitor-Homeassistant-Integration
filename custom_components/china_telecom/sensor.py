@@ -60,6 +60,23 @@ async def async_setup_entry(hass, entry, async_add_entities):
     sensors.append(ChinaTelecomSensor(coordinator, "specialUse", f"{masked_phonenum} 专用流量已用", "GB", "mdi:network", device_id))
     # 流量使用率传感器
     sensors.append(ChinaTelecomSensor(coordinator, "percentUsed", f"{masked_phonenum} 流量使用率", "%", "mdi:percent", device_id))
+    # 通用流量（套餐本身 + 结转 + 行业流量包，用户主要关注的口径）
+    sensors.append(ChinaTelecomSensor(coordinator, "commonBalance", f"{masked_phonenum} 通用流量剩余", "GB", "mdi:network", device_id))
+    sensors.append(ChinaTelecomSensor(coordinator, "commonPercentUsed", f"{masked_phonenum} 通用流量使用率", "%", "mdi:percent", device_id))
+    # 流量包明细：state = 生效中的流量包数量，attributes 里带逐包用量与到期时间
+    sensors.append(
+        ChinaTelecomSensor(
+            coordinator,
+            "flowPackages",
+            f"{masked_phonenum} 流量包明细",
+            None,
+            "mdi:package-variant-closed",
+            device_id,
+            attr_key="flowPackagesAttributes",
+        )
+    )
+    # 套餐名称
+    sensors.append(ChinaTelecomSensor(coordinator, "planName", f"{masked_phonenum} 套餐名称", None, "mdi:sim", device_id))
     
     # 通话信息
     sensors.append(ChinaTelecomSensor(coordinator, "voiceTotal", f"{masked_phonenum} 通话总量", "分钟", "mdi:phone", device_id))
@@ -192,9 +209,32 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
             payload_for_log,
         )
 
-    async def _process_important_data(self, important_data_raw):
+    async def _fetch_flux_packages(self, telecom):
+        """Best-effort fetch of the flow package detail (userFluxPackage).
+
+        This is the authoritative source for the general-purpose flow pool: it
+        lists the base plan, the rollover and every add-on pack separately,
+        whereas qryImportantData only returns a home-page summary whose
+        totalAmount.total/balance are frequently "0". A failure here must never
+        break the update, so it returns None and the caller falls back to the
+        home-page figures.
+        """
+        try:
+            return await self.hass.async_add_executor_job(telecom.user_flux_package)
+        except Exception as error:  # noqa: BLE001
+            _LOGGER.warning(
+                "China Telecom flow package query failed for %s: %s",
+                self.masked_phonenum,
+                error,
+            )
+            return None
+
+    async def _process_important_data(self, important_data_raw, flux_raw=None):
         telecom = await self._async_get_telecom()
         important_data = self._response_inner_data(important_data_raw)
+
+        if flux_raw is None:
+            flux_raw = await self._fetch_flux_packages(telecom)
 
         flow_info = important_data.get("flowInfo")
         voice_info = important_data.get("voiceInfo")
@@ -215,8 +255,42 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
             return dict(self.data)
 
         summary_data = await self.hass.async_add_executor_job(
-            telecom.to_summary, important_data, self.phonenum
+            telecom.to_summary, important_data, self.phonenum, flux_raw
         )
+
+        def to_gb(value):
+            return round(telecom.convert_flow(value, "GB", 2), 2)
+
+        flow_use_kb = summary_data.get("flowUse", 0)
+        flow_total_kb = summary_data.get("flowTotal", 0)
+        common_use_kb = summary_data.get("commonUse", 0)
+        common_total_kb = summary_data.get("commonTotal", 0)
+        flow_balance_kb = summary_data.get("flowBalance")
+
+        packages_gb = [
+            {
+                "name": item.get("name"),
+                "group": item.get("group"),
+                "kind": item.get("kind"),
+                "used_gb": to_gb(item.get("use", 0)),
+                "total_gb": to_gb(item.get("total", 0)),
+                "remaining_gb": to_gb(item.get("balance", 0)),
+                "unlimited": bool(item.get("unlimited")),
+                "expire": item.get("expire"),
+            }
+            for item in (summary_data.get("packages") or [])
+        ]
+        groups_gb = [
+            {
+                "title": item.get("title"),
+                "kind": item.get("kind"),
+                "count": item.get("count"),
+                "used_gb": to_gb(item.get("use", 0)),
+                "total_gb": to_gb(item.get("total", 0)),
+                "remaining_gb": to_gb(item.get("balance", 0)),
+            }
+            for item in (summary_data.get("groups") or [])
+        ]
 
         processed_data = {
             "balance": round(summary_data.get("balance", 0) / 100, 2),
@@ -224,15 +298,30 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
             "voiceUsage": summary_data.get("voiceUsage", 0),
             "voiceBalance": summary_data.get("voiceBalance", 0),
             "voiceTotal": summary_data.get("voiceTotal", 0),
-            "flowUse": round(telecom.convert_flow(summary_data.get("flowUse", 0), "GB", 2), 2),
-            "flowTotal": round(telecom.convert_flow(summary_data.get("flowTotal", 0), "GB", 2), 2),
-            "flowBalance": round(telecom.convert_flow(summary_data.get("flowTotal", 0) - summary_data.get("flowUse", 0), "GB", 2), 2),
-            "flowOver": round(telecom.convert_flow(summary_data.get("flowOver", 0), "GB", 2), 2),
-            "commonUse": round(telecom.convert_flow(summary_data.get("commonUse", 0), "GB", 2), 2),
-            "commonTotal": round(telecom.convert_flow(summary_data.get("commonTotal", 0), "GB", 2), 2),
-            "commonOver": round(telecom.convert_flow(summary_data.get("commonOver", 0), "GB", 2), 2),
-            "specialUse": round(telecom.convert_flow(summary_data.get("specialUse", 0), "GB", 2), 2),
-            "specialTotal": round(telecom.convert_flow(summary_data.get("specialTotal", 0), "GB", 2), 2),
+            "flowUse": to_gb(flow_use_kb),
+            "flowTotal": to_gb(flow_total_kb),
+            "flowBalance": to_gb(
+                flow_total_kb - flow_use_kb if flow_balance_kb is None else flow_balance_kb
+            ),
+            "flowOver": to_gb(summary_data.get("flowOver", 0)),
+            "commonUse": to_gb(common_use_kb),
+            "commonTotal": to_gb(common_total_kb),
+            "commonBalance": to_gb(summary_data.get("commonBalance", 0)),
+            "commonOver": to_gb(summary_data.get("commonOver", 0)),
+            "specialUse": to_gb(summary_data.get("specialUse", 0)),
+            "specialTotal": to_gb(summary_data.get("specialTotal", 0)),
+            "planName": summary_data.get("planName") or "未知",
+            "flowPackages": len(packages_gb),
+            "flowPackagesAttributes": {
+                "plan_name": summary_data.get("planName"),
+                "share_tip": summary_data.get("shareTip"),
+                "pack_count": len(packages_gb),
+                "packages": packages_gb,
+                "groups": groups_gb,
+                # Which endpoint supplied the 通用流量 figures, so a wrong reading
+                # can be traced without turning on debug logging.
+                "source": "userFluxPackage" if packages_gb else "qryImportantData",
+            },
             "points": summary_data.get("points", 0),
             "lastUpdate": datetime.now().astimezone().isoformat(timespec="seconds")
             if has_package_data
@@ -240,10 +329,18 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
         }
         
         # 计算流量使用率
-        if processed_data["flowTotal"] > 0:
-            processed_data["percentUsed"] = round((processed_data["flowUse"] / processed_data["flowTotal"]) * 100, 2)
+        if flow_total_kb > 0:
+            processed_data["percentUsed"] = round((flow_use_kb / flow_total_kb) * 100, 2)
         else:
             processed_data["percentUsed"] = 0
+
+        # 计算通用流量使用率（用户主要关注的指标）
+        if common_total_kb > 0:
+            processed_data["commonPercentUsed"] = round(
+                (common_use_kb / common_total_kb) * 100, 2
+            )
+        else:
+            processed_data["commonPercentUsed"] = 0
 
         # 计算通话使用率
         if processed_data["voiceTotal"] > 0:
@@ -387,7 +484,7 @@ class ChinaTelecomDataUpdateCoordinator(DataUpdateCoordinator):
 class ChinaTelecomSensor(Entity):
     """Representation of a China Telecom sensor."""
 
-    def __init__(self, coordinator, key, name, unit, icon, device_id):
+    def __init__(self, coordinator, key, name, unit, icon, device_id, attr_key=None):
         """Initialize the sensor."""
         self.coordinator = coordinator
         self.key = key
@@ -395,6 +492,9 @@ class ChinaTelecomSensor(Entity):
         self._unit = unit
         self._icon = icon
         self._device_id = device_id
+        # Optional dotted-free key pointing at a dict in the coordinator data to
+        # expose as extra state attributes (None = no extra attributes).
+        self._attr_key = attr_key
         phonenum_full = self.coordinator.phonenum
         self.masked_phonenum = f"{phonenum_full[:3]}****{phonenum_full[7:]}"
         self._unique_id = f"{self.masked_phonenum}_{device_id}_{key}"  # 在实体 ID 中添加号码
@@ -411,6 +511,13 @@ class ChinaTelecomSensor(Entity):
         if self.coordinator.data and self.key in self.coordinator.data:
             return self.coordinator.data.get(self.key)
         return None # 或其他默认值，例如 0
+
+    @property
+    def extra_state_attributes(self):
+        """Expose the detail dictionary attached to this entity, if any."""
+        if not self._attr_key or not self.coordinator.data:
+            return None
+        return self.coordinator.data.get(self._attr_key) or None
 
     @property
     def unit_of_measurement(self):
@@ -441,7 +548,7 @@ class ChinaTelecomSensor(Entity):
             "manufacturer": "中国电信",
             "entry_type": DeviceEntryType.SERVICE,
             "model": "CTM中国电信", 
-            "sw_version": "1.1.7" 
+            "sw_version": "1.1.7+local.1" 
         }
 
     @property
