@@ -1,7 +1,9 @@
+import json
 import logging
 import time
 
 from datetime import datetime, timedelta
+from pathlib import Path
 import uuid
 from homeassistant.helpers.entity import Entity
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -24,6 +26,18 @@ from .const import (
 from .telecom_class import Telecom 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _read_integration_version() -> str:
+    """从 manifest.json 读取集成版本，避免硬编码导致版本号漂移。"""
+    try:
+        with open(Path(__file__).parent / "manifest.json", encoding="utf-8") as fp:
+            return json.load(fp).get("version", "unknown")
+    except Exception:  # noqa: BLE001 - 版本号取不到不应影响集成加载
+        return "unknown"
+
+
+INTEGRATION_VERSION = _read_integration_version()
 
 
 async def async_setup_entry(hass, entry, async_add_entities):
@@ -548,7 +562,7 @@ class ChinaTelecomSensor(Entity):
             "manufacturer": "中国电信",
             "entry_type": DeviceEntryType.SERVICE,
             "model": "CTM中国电信", 
-            "sw_version": "1.1.7+local.1" 
+            "sw_version": INTEGRATION_VERSION
         }
 
     @property
