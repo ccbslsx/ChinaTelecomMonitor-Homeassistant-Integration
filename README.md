@@ -1,3 +1,46 @@
+# CTM电信 Home Assistant 集成（本地分支 · 含修复）
+
+> **本仓库是 [`hlhk2017/ChinaTelecomMonitor-Homeassistant-Integration`](https://github.com/hlhk2017/ChinaTelecomMonitor-Homeassistant-Integration) 的 fork，版本 `1.1.8`。**
+> 在 v1.1.7 基础上修了两个 bug，其余功能与上游一致。上游若有更新，可按需合并。
+
+## 本分支相对 v1.1.7 的改动
+
+### 1. 修复冷启动时多账号必有一个 setup 失败
+
+**现象**：HA 冷启动后，配置了两个及以上号码时，必有一个 config entry 报
+`RuntimeError: Added route will never be executed, method GET is already registered`
+（注册卡片静态路由 `/china_telecom/ctm-telecom-card.js`），该号码全部传感器不可用；
+手动 reload 一次即恢复正常。
+
+**原因**：HA 会**并发**加载同一集成下的多个 config entry。原实现为「查 flag → await → 置 flag」，
+两个 entry 同时通过检查，随后都去注册同一 URL，第二个抛错。
+
+**修复**：模块级 `asyncio.Lock` 串行化卡片引导；**在首个 `await` 之前就置 flag**（失败回滚）；
+静态路由注册包 `try/except RuntimeError`；并将整段卡片注册与传感器链路隔离
+（**卡片永远不会拖垮传感器**）。同时修复 `async_unload_entry` 使用了 HA 2025.6 已移除的
+`async_forward_entry_unload` 的问题（原写法一卸载即 AttributeError）。
+
+### 2. 修复流量总量 / 剩余用量不准
+
+**现象**：部分套餐（如「达量降速」类）上报的通用流量总量为 0 或等于已用量、剩余恒为 0。
+
+**原因**：`qryImportantData` 返回的 `totalAmount` / `commonFlow` 只是**首页文案提示**
+（`showField`=1 时给已用、=2 时给剩余，`total`/`balance` 常为 `"0"`）。
+真实的总量只存在于 `userFluxPackage`（逐流量包明细）与 `flowList`（逐行）中，
+而原 `sensor.py` 从未调用 `userFluxPackage`。
+
+**修复**：`to_summary()` 优先采用 `userFluxPackage` + `flowList` 计算通用/专用额度，
+`totalAmount` 仅作兜底；新增 `parse_traffic_kb()` 支持 `1.07GB` / `0KB` / `/共10.00GB` /
+`达40GB降速` 等形态。新增 4 个传感器：**通用流量剩余**、**通用流量使用率**、
+**流量包明细**（逐包已用/总量/剩余/失效时间，并带 `source` 属性标明数据来源）、**套餐名称**。
+
+**效果**（实测）：「天翼畅享40GB（199元）套餐」类账号由 `总量26GB / 剩余0GB / 100%`
+修正为 `总量101.07GB / 剩余75.07GB / 25.72%`（40GB 主套餐 + 7 个行业流量包）。
+
+> 原有传感器 entity_id 全部保留，可直接原地升级，无需重建配置。
+
+---
+
 # CTM电信 Home Assistant 集成（一体化）
 
 这是一个基于 [ChinaTelecomMonitor](https://github.com/Cp0204/ChinaTelecomMonitor) 核心逻辑，并**直接集成到 Home Assistant** 的中国电信话费、通话、流量套餐用量监控解决方案。
