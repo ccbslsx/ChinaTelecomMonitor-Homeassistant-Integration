@@ -1,6 +1,6 @@
 # CTM电信 Home Assistant 集成（本地分支 · 含修复）
 
-> **本仓库是 [`hlhk2017/ChinaTelecomMonitor-Homeassistant-Integration`](https://github.com/hlhk2017/ChinaTelecomMonitor-Homeassistant-Integration) 的 fork，版本 `1.1.8`。**
+> **本仓库是 [`hlhk2017/ChinaTelecomMonitor-Homeassistant-Integration`](https://github.com/hlhk2017/ChinaTelecomMonitor-Homeassistant-Integration) 的 fork（基于上游 v1.1.7），当前版本见 `custom_components/china_telecom/manifest.json`。**
 > 在 v1.1.7 基础上修了两个 bug，其余功能与上游一致。上游若有更新，可按需合并。
 
 ## 本分支相对 v1.1.7 的改动
