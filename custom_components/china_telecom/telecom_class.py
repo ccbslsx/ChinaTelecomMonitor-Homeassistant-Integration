@@ -11,7 +11,28 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.ssl_ import create_urllib3_context
 import certifi
 
-_LOGGER = logging.getLogger(__name__) 
+_LOGGER = logging.getLogger(__name__)
+
+#: Traffic units expressed in KB, the unit this module works in internally.
+TRAFFIC_UNITS_KB = {
+    "B": 1.0 / 1024.0,
+    "KB": 1.0,
+    "MB": 1024.0,
+    "GB": 1024.0 ** 2,
+    "TB": 1024.0 ** 3,
+}
+
+#: Matches a traffic figure with its unit inside arbitrary API wording, e.g.
+#: "1.07GB", "0KB", "/共10.00GB" or "达40GB降速". No \b is used because the
+#: characters following the unit are often CJK, which Python counts as word
+#: characters.
+TRAFFIC_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B)", re.IGNORECASE)
+BARE_NUMBER_PATTERN = re.compile(r"(\d+(?:\.\d+)?)")
+
+#: flowList entries already carry a unit-free GB figure in rightTitleEnd
+#: ("/61.07GB"); keep both as a defensive fallback for the "已用 + 降速" shape.
+DOWNSHIFT_PATTERN = re.compile(r"(\d+(?:\.\d+)?\s*[KMGT]B)", re.IGNORECASE)
+
 
 class TelecomSSLAdapter(HTTPAdapter):
     """自定义适配器解决SSL证书问题"""
@@ -391,7 +412,162 @@ PMpq0/XKBO8lYhN/gwIDAQAB
         except (TypeError, ValueError):
             return default
 
-    def to_summary(self, data, phonenum=""):
+    @classmethod
+    def parse_traffic_kb(cls, value):
+        """Parse an API traffic value into KB.
+
+        Handles the many shapes the China Telecom API uses: bare numbers and
+        numeric strings (already KB), plus decorated strings such as "1.07GB",
+        "0KB", "/共10.00GB" or "达40GB降速". Returns 0 when nothing can be
+        recognised, so a malformed field can never poison a total.
+        """
+        if value is None or isinstance(value, bool):
+            return 0
+        if isinstance(value, (int, float)):
+            return int(value)
+
+        text = str(value).strip()
+        if not text:
+            return 0
+
+        match = TRAFFIC_PATTERN.search(text)
+        if match:
+            size, unit = float(match.group(1)), match.group(2).upper()
+            return int(round(size * TRAFFIC_UNITS_KB[unit]))
+
+        # No unit: the API reports these already in KB ("27259260").
+        match = BARE_NUMBER_PATTERN.search(text.replace(",", ""))
+        if match and not re.search(r"[A-Za-z%]", text):
+            return int(float(match.group(1)))
+        return 0
+
+    def parse_flow_list(self, flow_list):
+        """Normalise flowInfo.flowList into [{name, use, balance, total}] in KB.
+
+        This is the per-line breakdown the app shows on its home page and it is
+        the only place a total is available for accounts whose
+        totalAmount.total/balance come back as "0" (e.g. 达量降速 plans).
+        """
+        items = []
+        for item in flow_list or []:
+            if not isinstance(item, dict):
+                continue
+            title = str(item.get("title") or "").strip()
+            if "流量" not in title:
+                continue
+
+            left_title = str(item.get("leftTitle") or "")
+            right_title = str(item.get("rightTitle") or "")
+            right_end = str(item.get("rightTitleEnd") or "")
+
+            try:
+                # 常规流量
+                if "已用" in left_title and "剩余" in right_title:
+                    item_use = self.parse_traffic_kb(item.get("leftTitleHh"))
+                    item_balance = self.parse_traffic_kb(item.get("rightTitleHh"))
+                    item_total = item_use + item_balance
+                # 常规流量，超流量
+                elif "超出" in left_title and "/" in right_end:
+                    item_balance = -self.parse_traffic_kb(item.get("leftTitleHh"))
+                    item_total = self.parse_traffic_kb(right_end.split("/")[-1])
+                    item_use = item_total - item_balance
+                # 无限流量，达量降速
+                elif "已用" in left_title and "降速" in right_title:
+                    match = DOWNSHIFT_PATTERN.search(right_title)
+                    item_total = self.parse_traffic_kb(match.group(1)) if match else 0
+                    item_use = self.parse_traffic_kb(item.get("leftTitleHh"))
+                    item_balance = max(item_total - item_use, 0)
+                else:
+                    _LOGGER.debug("Ignore flow entry: %s", item)
+                    continue
+            except Exception:  # noqa: BLE001
+                _LOGGER.warning("Failed to parse flow entry: %s", item, exc_info=True)
+                continue
+
+            items.append(
+                {
+                    "name": title,
+                    "use": item_use,
+                    "balance": item_balance,
+                    "total": item_total,
+                }
+            )
+        return items
+
+    def parse_flux_packages(self, flux_data):
+        """Normalise userFluxPackage into per-package and per-group totals.
+
+        Returns (packages, groups, plan_name, share_tip) with all traffic values
+        in KB. ``groups`` is keyed by the package group title the API itself
+        uses ("国内通用流量" and friends) and each entry carries a ``kind`` of
+        "通用" or "专用" so callers can total the general-purpose pool.
+        """
+        packages = []
+        groups = {}
+        plan_name = None
+        share_tip = None
+
+        if not isinstance(flux_data, dict):
+            return packages, groups, plan_name, share_tip
+
+        data = (flux_data.get("responseData") or {}).get("data")
+        if not isinstance(data, dict):
+            return packages, groups, plan_name, share_tip
+
+        main_product = data.get("mainProductOFFInfo")
+        if isinstance(main_product, dict):
+            plan_name = str(main_product.get("productOFFName") or "").strip() or None
+            share_tip = str(main_product.get("shareTipDesc") or "").strip() or None
+
+        ratable = data.get("productOFFRatable")
+        if not isinstance(ratable, dict):
+            return packages, groups, plan_name, share_tip
+
+        for group in ratable.get("ratableResourcePackages") or []:
+            if not isinstance(group, dict):
+                continue
+            title = str(group.get("title") or "未分类").strip()
+            # The API groups every general-purpose pack (base plan, rollover and
+            # add-on packs) under a title containing 通用; anything else is
+            # treated as dedicated/directional traffic.
+            kind = "通用" if "通用" in title else "专用"
+            bucket = groups.setdefault(
+                title,
+                {"title": title, "kind": kind, "use": 0, "balance": 0, "total": 0, "count": 0},
+            )
+
+            for item in group.get("productInfos") or []:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("isInvalid") or "0") == "1":
+                    continue
+
+                used = self.parse_traffic_kb(item.get("leftHighlight"))
+                balance = self.parse_traffic_kb(item.get("rightHighlight"))
+                total = self.parse_traffic_kb(item.get("rightCommon"))
+                if total <= 0:
+                    total = used + balance
+
+                packages.append(
+                    {
+                        "name": str(item.get("title") or "").strip(),
+                        "group": title,
+                        "kind": kind,
+                        "use": used,
+                        "balance": balance,
+                        "total": total,
+                        "expire": item.get("outOfServiceTime") or None,
+                        "unlimited": str(item.get("isInfiniteAmount") or "0") == "1",
+                    }
+                )
+                bucket["use"] += used
+                bucket["balance"] += balance
+                bucket["total"] += total
+                bucket["count"] += 1
+
+        return packages, groups, plan_name, share_tip
+
+    def to_summary(self, data, phonenum="", flux_data=None):
         if not data:
             return {}
         phonenum = phonenum or self.phonenum
@@ -400,23 +576,57 @@ PMpq0/XKBO8lYhN/gwIDAQAB
         voice_info = data.get("voiceInfo") or {}
         integral_info = data.get("integralInfo") or {}
 
-        # 总流量
+        # 首页汇总：totalAmount / commonFlow 只是“首页显示提示”，showField=1 时给
+        # 已用、=2 时给剩余，total/balance 常见为 "0"。真实总量只有 flowList
+        # 与 userFluxPackage 才有，所以这里只把它们当作回退值。
         total_amount = flow_info.get("totalAmount") or {}
-        flow_use = int(total_amount.get("used") or 0)
-        flow_balance = int(total_amount.get("balance") or 0)
-        flow_total = flow_use + flow_balance
-        flow_over = int(total_amount.get("over") or 0)
-        # 通用流量
+        amount_use = int(self._to_number(total_amount.get("used")))
+        amount_balance = int(self._to_number(total_amount.get("balance")))
+        amount_total = int(self._to_number(total_amount.get("total")))
+        flow_over = int(self._to_number(total_amount.get("over")))
+
         common_flow = flow_info.get("commonFlow") or {}
-        common_use = int(common_flow.get("used") or 0)
-        common_balance = int(common_flow.get("balance") or 0)
-        common_total = common_use + common_balance
-        common_over = int(common_flow.get("over") or 0)
-        # 专用流量
-        special_amount = flow_info.get("specialAmount") or {}
-        special_use = int(special_amount.get("used") or 0)
-        special_balance = int(special_amount.get("balance") or 0)
-        special_total = special_use + special_balance
+        common_use_fallback = int(self._to_number(common_flow.get("used")))
+        common_balance_fallback = int(self._to_number(common_flow.get("balance")))
+        common_over = int(self._to_number(common_flow.get("over")))
+
+        # 首页逐条列出的流量（“已用 / 剩余 / 共”）
+        flow_items = self.parse_flow_list(flow_info.get("flowList") or [])
+        list_use = sum(item["use"] for item in flow_items)
+        list_balance = sum(item["balance"] for item in flow_items)
+        list_total = sum(item["total"] for item in flow_items)
+
+        if list_total > 0:
+            flow_use = max(list_use, amount_use)
+            flow_total = max(list_total, flow_use)
+        else:
+            flow_use = amount_use
+            flow_total = max(amount_total, amount_use + amount_balance, flow_use)
+        flow_balance = max(flow_total - flow_use, 0)
+
+        # 流量包明细（userFluxPackage）：通用/专用拆分的最权威来源
+        packages, groups, plan_name, share_tip = self.parse_flux_packages(flux_data)
+        common_group = next((g for g in groups.values() if g["kind"] == "通用"), None)
+        special_group = next((g for g in groups.values() if g["kind"] != "通用"), None)
+
+        if common_group and common_group["total"] > 0:
+            common_use = common_group["use"]
+            common_balance = common_group["balance"]
+            common_total = common_group["total"]
+        else:
+            common_use = common_use_fallback
+            common_balance = common_balance_fallback
+            common_total = common_use + common_balance
+
+        if special_group and special_group["total"] > 0:
+            special_use = special_group["use"]
+            special_balance = special_group["balance"]
+            special_total = special_group["total"]
+        else:
+            special_amount = flow_info.get("specialAmount") or {}
+            special_use = int(self._to_number(special_amount.get("used")))
+            special_balance = int(self._to_number(special_amount.get("balance")))
+            special_total = special_use + special_balance
 
         # 语音通话
         voice_data_info = voice_info.get("voiceDataInfo") or {}
@@ -452,45 +662,6 @@ PMpq0/XKBO8lYhN/gwIDAQAB
         # 积分
         points = int(self._to_number(integral_info.get("integral")))
 
-        # ==========================
-        # 流量包列表
-        flowItems = []
-        flow_lists = flow_info.get("flowList", [])
-        for item in flow_lists:
-            if "流量" not in item["title"]:
-                continue
-            # 常规流量
-            if "已用" in item["leftTitle"] and "剩余" in item["rightTitle"]:
-                item_use = self.convert_flow(item["leftTitleHh"], "KB")
-                item_balance = self.convert_flow(item["rightTitleHh"], "KB")
-                item_total = item_use + item_balance
-            # 常规流量，超流量
-            elif "超出" in item["leftTitle"] and "/" in item["rightTitleEnd"]:
-                item_balance = -self.convert_flow(item["leftTitleHh"], "KB")
-                item_use = (
-                    self.convert_flow(item["rightTitleEnd"].split("/")[1], "KB")
-                    - item_balance
-                )
-                item_total = item_use + item_balance
-            # 无限流量，达量降速
-            elif "已用" in item["leftTitle"] and "降速" in item["rightTitle"]:
-                item_total = self.convert_flow(
-                    re.search(r"(\d+[KMGT]B)", item["rightTitle"]).group(1), "KB"
-                )
-                item_use = self.convert_flow(item["leftTitleHh"], "KB")
-                item_balance = item_total - item_use
-            # 忽略其他不能识别的情形
-            else:
-                print(f"Ignore flow: {item}")
-                continue
-            flowItems.append(
-                {
-                    "name": item["title"],
-                    "use": item_use,
-                    "balance": item_balance,
-                    "total": item_total,
-                }
-            )
         summary = {
             "phonenum": phonenum,
             "balance": balance,
@@ -500,15 +671,21 @@ PMpq0/XKBO8lYhN/gwIDAQAB
             "voiceTotal": voice_total,
             "flowUse": flow_use,
             "flowTotal": flow_total,
+            "flowBalance": flow_balance,
             "flowOver": flow_over,
             "commonUse": common_use,
             "commonTotal": common_total,
+            "commonBalance": common_balance,
             "commonOver": common_over,
             "specialUse": special_use,
             "specialTotal": special_total,
             "points": points, 
             "createTime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "flowItems": flowItems,
+            "flowItems": flow_items,
+            "packages": packages,
+            "groups": list(groups.values()),
+            "planName": plan_name,
+            "shareTip": share_tip,
         }
         return summary
 
